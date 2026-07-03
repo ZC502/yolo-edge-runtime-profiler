@@ -30,7 +30,7 @@ It does **not** modify YOLO, retrain models, hook neural-network layers, or requ
 
 ## Why This Exists
 
-Traditional YOLO benchmarking usually reports average speed or average FPS. That is useful, but it can hide tail latency.
+YOLO benchmarking usually reports average speed or average FPS. That is useful, but it can hide tail latency.
 
 In real deployments, the failure mode is often not:
 
@@ -62,7 +62,7 @@ RED    -> severe tail latency or stage pressure
 
 ## Roadmap: Pressure-Triggered Hard Example Mining
 
-YERP starts as a lightweight runtime profiler, but the long-term goal is larger: turn edge-runtime pressure into a data selection signal.
+YERP(YOLO Edge-Runtime Profiler) starts as a lightweight runtime profiler, but the long-term goal is larger: turn edge-runtime pressure into a data selection signal.
 
 Most active learning pipelines select samples from model uncertainty alone. That is useful, but it misses a critical deployment question:
 
