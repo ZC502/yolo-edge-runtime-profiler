@@ -227,7 +227,7 @@ RED:
 
 Tune them for your deployment target.
 
-## Relation to OBIO
+## Relation to OBIO(Offboard Boundary Integrity Observer)
 
 This package is the model-runtime layer.
 
@@ -255,6 +255,8 @@ Which YOLO runtime stage is creating tail latency?
 ```
 
 The two are complementary.
+
+[Offboard Boundary Integrity Observer](https://github.com/ZC502/ai_flight_integrity_observer.git)
 
 ## What This Is Not
 
