@@ -281,6 +281,8 @@ Resource-Aware Adapter:
   Use these signals to back off before vision load starves control.
 ```
 
+Details：https://github.com/ZC502/ai_flight_integrity_observer.git
+
 ## License
 
 Apache-2.0
