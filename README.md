@@ -2,6 +2,11 @@
 
 **Catch YOLO tail latency, stage imbalance, and postprocess spikes from `Results.speed`.**
 
+Now with local-first hard-example capture:
+when edge-runtime pressure spikes, YERP（YOLO Edge-Runtime Profiler） can save the exact frames and metadata that caused it.
+
+---
+
 `YOLO Edge-Runtime Profiler` is a small, zero-intrusion runtime profiler for Ultralytics YOLO deployments. It is designed for edge and production users who already know that average FPS is not enough.
 
 It answers the question:
@@ -59,6 +64,22 @@ GREEN  -> stable
 YELLOW -> tail latency or stage pressure rising
 RED    -> severe tail latency or stage pressure
 ```
+
+## Local-First Hard Example Capture
+
+YERP can optionally save frames when runtime pressure appears.
+
+Instead of labeling random frames, you can collect the frames that actually made the edge runtime unstable:
+
+- tail-latency spikes
+- postprocess spikes
+- dense detection bursts
+- high output entropy
+- stage imbalance
+
+YERP saves both the image and a sidecar JSON file containing the runtime residuals.
+
+This is local-first. Nothing is uploaded unless you build or enable your own integration.
 
 ## Roadmap: Pressure-Triggered Hard Example Mining
 
