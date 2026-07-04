@@ -4,7 +4,6 @@ import argparse
 import sys
 
 from .profiler import YoloEdgeRuntimeProfiler, ProfilerConfig
-from .dashboard import print_dashboard
 from .hard_examples import LocalHardExampleRecorder
 
 
