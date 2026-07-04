@@ -1,21 +1,17 @@
 # YOLO Edge-Runtime Profiler
 
-**Catch YOLO tail latency, stage imbalance, and postprocess spikes from `Results.speed`.**
+**Catch YOLO tail latency, stage imbalance, postprocess spikes, and pressure-triggered hard examples from `Results.speed`.**
 
-Now with local-first hard-example capture:
-when edge-runtime pressure spikes, YERP（YOLO Edge-Runtime Profiler） can save the exact frames and metadata that caused it.
+`YOLO Edge-Runtime Profiler` (YERP) is a small, zero-intrusion runtime profiler for Ultralytics YOLO deployments. It is designed for edge and production users who already know that average FPS is not enough.
 
----
-
-`YOLO Edge-Runtime Profiler` is a small, zero-intrusion runtime profiler for Ultralytics YOLO deployments. It is designed for edge and production users who already know that average FPS is not enough.
-
-It answers the question:
+It answers two practical questions:
 
 ```text
 My average FPS looks fine. Why does the system still occasionally stall?
+Which frames should I keep for debugging, labeling, and retraining?
 ```
 
-The profiler consumes Ultralytics `Results` objects and tracks:
+YERP consumes Ultralytics `Results` objects and tracks:
 
 ```text
 preprocess_ms
@@ -31,11 +27,13 @@ confidence entropy
 class-distribution entropy
 ```
 
-It does **not** modify YOLO, retrain models, hook neural-network layers, or require ROS 2.
+It can also run a **local-first hard-example recorder**: when runtime pressure or confidence uncertainty appears, YERP saves the frame plus a sidecar JSON file with the runtime residuals.
+
+YERP does **not** modify YOLO, retrain models, hook neural-network layers, require ROS 2, or upload your data.
 
 ## Why This Exists
 
-YOLO benchmarking usually reports average speed or average FPS. That is useful, but it can hide tail latency.
+Traditional YOLO benchmarking usually reports average speed or average FPS. That is useful, but it can hide tail latency.
 
 In real deployments, the failure mode is often not:
 
@@ -65,67 +63,7 @@ YELLOW -> tail latency or stage pressure rising
 RED    -> severe tail latency or stage pressure
 ```
 
-## Local-First Hard Example Capture
-
-YERP can optionally save frames when runtime pressure appears.
-
-Instead of labeling random frames, you can collect the frames that actually made the edge runtime unstable:
-
-- tail-latency spikes
-- postprocess spikes
-- dense detection bursts
-- high output entropy
-- stage imbalance
-
-YERP saves both the image and a sidecar JSON file containing the runtime residuals.
-
-This is local-first. Nothing is uploaded unless you build or enable your own integration.
-
-## Roadmap: Pressure-Triggered Hard Example Mining
-
-YERP(YOLO Edge-Runtime Profiler) starts as a lightweight runtime profiler, but the long-term goal is larger: turn edge-runtime pressure into a data selection signal.
-
-Most active learning pipelines select samples from model uncertainty alone. That is useful, but it misses a critical deployment question:
-
-```text
-Which frames actually made the edge system unstable?
-```
-
-YERP can detect frames associated with:
-
-```text
-tail-latency spikes
-stage imbalance
-postprocess pressure
-high output entropy
-dense detection bursts
-runtime instability on edge devices
-```
-
-The next step is a local-first Pressure Data Bag:
-
-```text
-trigger:   YERP enters YELLOW or RED
-capture:   current frame or short frame window
-metadata:  latency, stage split, box count, entropy, dominant cause
-storage:   local folder, private object store, or future platform integration
-```
-
-This creates a deployment-driven active learning loop:
-
-```text
-deploy YOLO at the edge
-        ↓
-detect runtime pressure
-        ↓
-capture high-value long-tail frames
-        ↓
-review / label / retrain
-        ↓
-redeploy a more stable model
-```
-
-YERP is local-first by design. Image capture and upload should be explicit, optional, and privacy-aware.
+For low-postprocess or end-to-end models, YERP de-emphasizes postprocess-specific alarms and continues auditing total / preprocess / inference tail latency.
 
 ## Install
 
@@ -143,7 +81,7 @@ Optional dependencies for examples:
 pip install ultralytics opencv-python
 ```
 
-The core package only requires Python and NumPy.
+The core package only requires Python and NumPy. Image capture uses OpenCV or PIL when available.
 
 ## 5-Line Integration
 
@@ -157,10 +95,78 @@ profiler = YoloEdgeRuntimeProfiler(window_size=100)
 for result in model("video.mp4", stream=True):
     status = profiler.update(result)
     print(status.to_compact_string())
-
-profiler.export_json("runtime_report.json")
-profiler.export_csv("runtime_frames.csv")
 ```
+
+## Local-First Hard Example Capture
+
+YERP can optionally save high-value frames when runtime pressure or confidence uncertainty appears.
+
+Instead of labeling random frames, collect the frames that actually made the edge runtime unstable（Zero I/O bottleneck: Built-in cooldowns and max-item limits ensure the profiler never crashes your edge device.）:
+
+```text
+tail-latency spikes
+postprocess spikes
+stage imbalance
+dense detection bursts
+high confidence entropy
+low mean confidence
+```
+
+Example:
+
+```python
+from ultralytics import YOLO
+from yolo_edge_runtime_profiler import YoloEdgeRuntimeProfiler, LocalHardExampleRecorder
+
+model = YOLO("yolov8n.pt")
+profiler = YoloEdgeRuntimeProfiler(window_size=100)
+recorder = LocalHardExampleRecorder(
+    output_dir="hard_examples",
+    selection_mode="pressure_or_confidence",
+    trigger_states=("RED",),
+    cooldown_sec=2.0,
+    max_items=200,
+    # Optional confidence dimension. Tune for your use case.
+    min_confidence_entropy=None,
+    max_confidence_mean=None,
+)
+
+for result in model("video.mp4", stream=True):
+    status = profiler.update(result)
+    frame = getattr(result, "orig_img", None)
+    recorder.maybe_save(frame=frame, status=status)
+```
+
+Output:
+
+```text
+hard_examples/
+├── frame_000127_1783000000123_RED_POSTPROCESS_SPIKE.jpg
+└── frame_000127_1783000000123_RED_POSTPROCESS_SPIKE.json
+```
+
+The JSON sidecar stores the full runtime context:
+
+```json
+{
+  "schema": "yolo-edge-runtime-profiler.hard-example.v0.1",
+  "selection": {
+    "reason": "runtime_pressure",
+    "pressure_signal": {"state": "RED", "dominant_cause": "POSTPROCESS_SPIKE"},
+    "confidence_signal": {"confidence_entropy": 2.74, "confidence_mean": 0.41}
+  },
+  "status": {
+    "state": "RED",
+    "dominant_cause": "POSTPROCESS_SPIKE",
+    "stage_ms": {"preprocess": 2.1, "inference": 12.4, "postprocess": 76.8, "total": 91.3},
+    "latency_ms": {"p50": 18.6, "p95": 47.2, "p99": 91.3},
+    "residuals": {"tail_latency_coeff_p95_p50": 2.54, "postprocess_spike_coeff": 5.2}
+  },
+  "privacy_note": "Local-first capture. No upload was performed by YERP."
+}
+```
+
+This is the local-first foundation for pressure-triggered hard-example mining. Nothing is uploaded unless you build or enable your own integration.
 
 ## CLI Usage
 
@@ -170,10 +176,28 @@ yolo-edge-profile --model yolov8n.pt --source video.mp4 --dashboard \
   --csv runtime_frames.csv
 ```
 
+Enable local hard-example capture:
+
+```bash
+yolo-edge-profile --model yolov8n.pt --source video.mp4 --dashboard \
+  --capture-dir hard_examples \
+  --capture-states RED \
+  --capture-cooldown-sec 2.0
+```
+
+Confidence-aware sampling can be added without changing the model:
+
+```bash
+yolo-edge-profile --model yolov8n.pt --source video.mp4 \
+  --capture-dir hard_examples \
+  --capture-selection-mode pressure_or_confidence \
+  --capture-min-confidence-entropy 1.8
+```
+
 Camera example:
 
 ```bash
-yolo-edge-profile --model yolov8n.pt --source 0 --dashboard
+yolo-edge-profile --model yolov8n.pt --source 0 --dashboard --capture-dir hard_examples
 ```
 
 Synthetic demo without Ultralytics:
@@ -206,84 +230,57 @@ This identifies whether preprocess, inference, or postprocess is dominating the 
 R_post = current_postprocess_ms / rolling_median_postprocess_ms
 ```
 
-This catches sudden postprocess spikes, often associated with dense scenes or unusually high output pressure.
+This flags sudden postprocess pressure, especially in dense scenes or output-heavy frames.
 
 ### 4. Output Pressure
 
 ```text
 box_count
-confidence entropy
-class-distribution entropy
+box_pressure_coeff
+confidence_entropy
+class_entropy
 ```
 
-This helps correlate runtime spikes with scene complexity.
+This records whether the detection output stream is becoming dense or uncertain.
 
-### 5. Low-Postprocess / End-to-End Path Detection
-
-If the rolling postprocess time is near zero, the profiler de-emphasizes postprocess spike alarms and focuses on total tail latency and preprocess / inference stability.
-
-Example log:
+### 5. Runtime State
 
 ```text
-[INFO] Low-postprocess path detected. Postprocess lag appears minimal; auditing total and stage tail latency instead.
+GREEN / YELLOW / RED
 ```
 
-This avoids false alarms for end-to-end or NMS-free-style pipelines.
+Each state includes a `dominant_cause` and a human-readable reason.
 
-## Recommended Thresholds
+## Design Notes
 
-Default thresholds are conservative heuristics:
+YERP is deliberately not a cloud platform. The current scope is:
 
 ```text
-YELLOW:
-  p95/p50 total latency >= 2.0
-  or postprocess ratio >= 0.30
-  or postprocess spike >= 2.0x
-
-RED:
-  p95/p50 total latency >= 4.0
-  or postprocess ratio >= 0.50
-  or postprocess spike >= 4.0x
+profile runtime stages
+classify tail-latency and stage pressure
+save local hard examples when pressure or uncertainty appears
+export JSON / CSV reports
 ```
 
-Tune them for your deployment target.
+Future integrations can connect the local hard-example folder to a private dataset store, labeling workflow, or training platform.
 
-## Relation to OBIO(Offboard Boundary Integrity Observer)
+## Relationship to OBIO
 
-This package is the model-runtime layer.
+YERP is the pure-Python edge-runtime layer.
+
+OBIO is the downstream physical-boundary observer for ROS 2 / PX4 / robot execution paths.
 
 ```text
-YOLO Edge-Runtime Profiler
-  -> audits YOLO runtime pressure
+YERP:
+  Which YOLO runtime stage is creating pressure?
 
-Resource-Aware YOLO Adapter
-  -> consumes runtime or boundary pressure and throttles workload
+OBIO:
+  Is that pressure reaching the physical execution boundary?
 
-OBIO Core
-  -> audits the physical execution boundary in ROS 2 / PX4 systems
+Resource-Aware Adapter:
+  Use these signals to back off before vision load starves control.
 ```
-
-OBIO asks:
-
-```text
-Is the physical execution boundary still healthy?
-```
-
-This profiler asks:
-
-```text
-Which YOLO runtime stage is creating tail latency?
-```
-
-The two are complementary.
-
-[Offboard Boundary Integrity Observer](https://github.com/ZC502/ai_flight_integrity_observer.git)
-
-## What This Is Not
-
-This tool does not improve mAP, retrain YOLO, replace TensorRT benchmarking, or certify safety. It is a lightweight runtime diagnostic tool for deployment debugging.
 
 ## License
 
 Apache-2.0
-
