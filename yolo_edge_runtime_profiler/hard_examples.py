@@ -1,4 +1,3 @@
-cat > yolo_edge_runtime_profiler/hard_examples.py <<'PY'
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
