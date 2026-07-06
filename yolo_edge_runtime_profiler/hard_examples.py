@@ -1,8 +1,9 @@
+cat > yolo_edge_runtime_profiler/hard_examples.py <<'PY'
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 import json
 import re
 import time
@@ -28,6 +29,7 @@ class LocalHardExampleConfig:
     Local-first hard-example capture policy.
 
     The recorder is deliberately local-only. It never uploads frames.
+    Defaults are conservative to avoid saving micro-jitter and low-value frames.
     """
 
     output_dir: str = "hard_examples"
@@ -40,24 +42,26 @@ class LocalHardExampleConfig:
     #   pressure_and_confidence: require both signals
     selection_mode: str = "pressure_or_confidence"
 
+    # Conservative default: capture only high-severity runtime events.
     trigger_states: Tuple[str, ...] = ("RED",)
     trigger_causes: Tuple[str, ...] = (
         "TAIL_LATENCY_SPIKE",
-        "TAIL_LATENCY_RISING",
         "POSTPROCESS_SPIKE",
-        "POSTPROCESS_SPIKE_RISING",
         "POSTPROCESS_DOMINANT",
-        "POSTPROCESS_PRESSURE",
     )
 
     # Optional confidence/uncertainty triggers. Disabled when None.
     min_confidence_entropy: Optional[float] = None
     max_confidence_mean: Optional[float] = None
-    min_box_count: int = 1
+
+    # Minimum detections for confidence-triggered and pressure-triggered capture.
+    # This filters out single-box micro-jitter that is not a useful hard example.
+    min_box_count: int = 5
+    min_box_count_for_pressure: int = 5
 
     # Safety guards to avoid turning capture into a new I/O bottleneck.
     cooldown_sec: float = 2.0
-    max_items: int = 200
+    max_items: int = 50
     require_enough_samples: bool = True
 
     # Image persistence.
@@ -90,9 +94,10 @@ class LocalHardExampleRecorder:
         trigger_causes: Optional[Sequence[str]] = None,
         min_confidence_entropy: Optional[float] = None,
         max_confidence_mean: Optional[float] = None,
-        min_box_count: int = 1,
+        min_box_count: int = 5,
+        min_box_count_for_pressure: Optional[int] = None,
         cooldown_sec: float = 2.0,
-        max_items: int = 200,
+        max_items: int = 50,
     ) -> None:
         if config is None:
             config = LocalHardExampleConfig(
@@ -103,9 +108,10 @@ class LocalHardExampleRecorder:
                 trigger_causes=tuple(trigger_causes) if trigger_causes is not None else LocalHardExampleConfig.trigger_causes,
                 min_confidence_entropy=min_confidence_entropy,
                 max_confidence_mean=max_confidence_mean,
-                min_box_count=min_box_count,
-                cooldown_sec=cooldown_sec,
-                max_items=max_items,
+                min_box_count=int(min_box_count),
+                min_box_count_for_pressure=int(min_box_count_for_pressure if min_box_count_for_pressure is not None else min_box_count),
+                cooldown_sec=float(cooldown_sec),
+                max_items=int(max_items),
             )
         self.config = config
         self.output_dir = Path(self.config.output_dir)
@@ -218,15 +224,20 @@ class LocalHardExampleRecorder:
     def _pressure_signal(self, status: RuntimeStatus) -> Dict[str, Any]:
         state = _state_value(status.state)
         cause = str(status.dominant_cause or "")
+        box_count = int(status.output_pressure.get("box_count", 0) or 0)
         state_match = state in set(self.config.trigger_states)
         cause_match = (not self.config.trigger_causes) or cause in set(self.config.trigger_causes)
-        active = state_match and cause_match
+        box_count_match = box_count >= int(self.config.min_box_count_for_pressure)
+        active = state_match and cause_match and box_count_match
         return {
             "active": bool(active),
             "state": state,
             "dominant_cause": cause,
+            "box_count": box_count,
             "state_match": bool(state_match),
             "cause_match": bool(cause_match),
+            "box_count_match": bool(box_count_match),
+            "min_box_count_for_pressure": int(self.config.min_box_count_for_pressure),
             "trigger_states": list(self.config.trigger_states),
             "trigger_causes": list(self.config.trigger_causes),
         }
@@ -236,9 +247,10 @@ class LocalHardExampleRecorder:
         conf_entropy = float(status.output_pressure.get("confidence_entropy", 0.0) or 0.0)
         conf_mean = float(status.output_pressure.get("confidence_mean", 0.0) or 0.0)
 
+        box_count_match = box_count >= int(self.config.min_box_count)
         entropy_active = False
         mean_active = False
-        if box_count >= self.config.min_box_count:
+        if box_count_match:
             if self.config.min_confidence_entropy is not None:
                 entropy_active = conf_entropy >= float(self.config.min_confidence_entropy)
             if self.config.max_confidence_mean is not None:
@@ -251,7 +263,8 @@ class LocalHardExampleRecorder:
             "confidence_mean": conf_mean,
             "min_confidence_entropy": self.config.min_confidence_entropy,
             "max_confidence_mean": self.config.max_confidence_mean,
-            "min_box_count": self.config.min_box_count,
+            "min_box_count": int(self.config.min_box_count),
+            "box_count_match": bool(box_count_match),
             "entropy_active": bool(entropy_active),
             "mean_active": bool(mean_active),
         }
@@ -330,3 +343,4 @@ def _write_image(path: Path, frame: Any) -> bool:
         return True
     except Exception:
         return False
+PY
