@@ -432,4 +432,3 @@ class YoloEdgeRuntimeProfiler:
             "dominant_causes": cause_counts,
             "latest": latest.to_dict(),
         }
-PY
