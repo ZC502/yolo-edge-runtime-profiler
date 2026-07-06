@@ -342,4 +342,4 @@ def _write_image(path: Path, frame: Any) -> bool:
         return True
     except Exception:
         return False
-PY
+
