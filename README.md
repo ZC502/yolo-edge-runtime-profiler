@@ -1,35 +1,61 @@
 # YOLO Edge-Runtime Profiler
 
-**Catch YOLO tail latency, stage imbalance, postprocess spikes, and pressure-triggered hard examples from `Results.speed`.**
+**Stop looking only at average FPS.**  
+**Find the frames that make YOLO unstable at runtime.**
 
-`YOLO Edge-Runtime Profiler` (YERP) is a small, zero-intrusion runtime profiler for Ultralytics YOLO deployments. It is designed for edge and production users who already know that average FPS is not enough.
+YERP is a lightweight runtime profiler for Ultralytics YOLO deployments.
 
-It answers two practical questions:
+It reads the official `Results.speed` output and tracks:
+
+- tail latency
+- preprocess / inference / postprocess imbalance
+- postprocess spikes
+- output pressure
+- confidence entropy
+- box-count pressure
+
+When runtime pressure appears, YERP can locally save the frame and a JSON sidecar with the full runtime context.
+
+This turns edge-runtime instability into a hard-example mining signal for future labeling, debugging, and active learning.
+
+*_YERP does **not** modify YOLO, retrain models, hook neural-network layers, require ROS 2, or upload your data_.*
+
+## Runtime-Pressure + Confidence-Aware Hard Example Capture
+
+Most active-learning pipelines sample frames from model uncertainty alone.
+
+YERP adds a deployment signal:
 
 ```text
-My average FPS looks fine. Why does the system still occasionally stall?
-Which frames should I keep for debugging, labeling, and retraining?
+model uncertainty
+        +
+edge-runtime pressure
 ```
 
-YERP consumes Ultralytics `Results` objects and tracks:
+Instead of saving random frames, YERP captures frames that are associated with:
+- tail-latency spikes
+- postprocess pressure
+- stage imbalance
+- dense detection output
+- high confidence entropy
+- low-confidence detections
 
-```text
-preprocess_ms
-inference_ms
-postprocess_ms
-total_ms
-p50 / p95 / p99 / max latency
-tail-latency coefficient
-postprocess spike residual
-stage-imbalance ratio
-box count
-confidence entropy
-class-distribution entropy
+Each captured frame is saved locally with a JSON sidecar:
+```
+hard_examples/
+  frame_000123_RED_POSTPROCESS_SPIKE.jpg
+  frame_000123_RED_POSTPROCESS_SPIKE.json
 ```
 
-It can also run a **local-first hard-example recorder**: when runtime pressure or confidence uncertainty appears, YERP saves the frame plus a sidecar JSON file with the runtime residuals.
-
-YERP does **not** modify YOLO, retrain models, hook neural-network layers, require ROS 2, or upload your data.
+The JSON sidecar contains:
+- YOLO stage timing
+- rolling p50 / p95 / p99 latency
+- dominant runtime cause
+- box count
+- confidence statistics
+- entropy metrics
+- capture policy
+YERP is local-first. It does not upload images or metadata.
 
 ## Why This Exists
 
@@ -264,24 +290,19 @@ export JSON / CSV reports
 
 Future integrations can connect the local hard-example folder to a private dataset store, labeling workflow, or training platform.
 
-## Relationship to OBIO
+## Roadmap: Runtime Integrity Residuals
 
-YERP is the pure-Python edge-runtime layer.
+YERP v0.1 focuses on practical runtime residuals: tail latency, stage imbalance, postprocess spikes, and output pressure.
 
-OBIO is the downstream physical-boundary observer for ROS 2 / PX4 / robot execution paths.
+Future versions may extend this into deeper runtime integrity residuals:
 
-```text
-YERP:
-  Which YOLO runtime stage is creating pressure?
+- temporal detection associators
+- embedding drift
+- multi-scale feature inconsistency
+- pre-NMS / post-NMS candidate flow
+- small-perturbation output residuals
 
-OBIO:
-  Is that pressure reaching the physical execution boundary?
-
-Resource-Aware Adapter:
-  Use these signals to back off before vision load starves control.
-```
-
-Details：https://github.com/ZC502/ai_flight_integrity_observer.git
+This direction is inspired by NARH-style residual auditing, but the current release intentionally stays lightweight and zero-intrusive.
 
 ## License
 
