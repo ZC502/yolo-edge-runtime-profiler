@@ -6,7 +6,14 @@ import time
 
 import numpy as np
 
-from .metrics import EPS, RollingWindow, entropy_from_labels, entropy_from_values, normalize_speed_dict, safe_float
+from .metrics import (
+    EPS,
+    RollingWindow,
+    entropy_from_labels,
+    entropy_from_values,
+    normalize_speed_dict,
+    safe_float,
+)
 from .status import RuntimeState, RuntimeStatus, max_state
 from .exporters import JsonExporter, CsvExporter
 
@@ -16,24 +23,30 @@ class ProfilerConfig:
     window_size: int = 100
     min_window: int = 10
 
-    # Frames used to initialize the runtime, video decoder, CUDA/PyTorch context, etc.
-    # Warmup frames are reported, but are NOT used for the rolling baseline and cannot trigger capture.
+    # Cold start protection.
+    # Warmup frames are reported as GREEN/WARMUP, but are NOT added to the rolling baseline.
     warmup_frames: int = 30
 
-    # Tail latency must be both absolutely large and relatively large.
-    # This prevents small 1-2 ms micro-jitter from becoming a false RED/YELLOW event.
+    # Tail latency is only meaningful if the current frame is both:
+    #   1) absolutely slow enough
+    #   2) inflated relative to the rolling p50 baseline
     min_tail_latency_ms: float = 30.0
     yellow_tail_coeff: float = 2.0
     red_tail_coeff: float = 4.0
 
-    # Postprocess pressure must also pass an absolute-ms gate.
+    # Postprocess pressure thresholds.
     yellow_postprocess_ratio: float = 0.30
     red_postprocess_ratio: float = 0.50
     yellow_postprocess_spike: float = 2.0
     red_postprocess_spike: float = 4.0
+
+    # Absolute gates to suppress micro-jitter.
     low_postprocess_ms: float = 3.0
     min_postprocess_ms_for_spike: float = 3.0
     min_postprocess_ms_for_pressure: float = 3.0
+
+    # Sparse scenes with 1-2 boxes should not trigger postprocess pressure alarms.
+    min_box_count_for_postprocess_pressure: int = 5
 
     confidence_entropy_bins: int = 10
     enable_color: bool = True
@@ -105,16 +118,22 @@ class YoloEdgeRuntimeProfiler:
 
         confidences = list(confidences or [])
         classes = list(classes or [])
+
         conf_mean = float(np.mean(confidences)) if confidences else 0.0
         conf_min = float(np.min(confidences)) if confidences else 0.0
         conf_max = float(np.max(confidences)) if confidences else 0.0
         confidence_entropy = entropy_from_values(confidences, bins=self.config.confidence_entropy_bins)
         class_entropy = entropy_from_labels(classes)
 
-        # Warmup frames are intentionally excluded from the rolling baseline.
-        # This prevents CUDA/PyTorch/OpenCV/video-decoder cold-start spikes from poisoning p95/p99.
+        # ------------------------------------------------------------------
+        # 1) Warmup frames: do not enter rolling baseline.
+        # ------------------------------------------------------------------
         if self.frame_index <= self.config.warmup_frames:
-            rolling = self._current_only_stats(total_ms=total, postprocess_ms=post, box_count=box_count)
+            rolling = self._current_only_stats(
+                total_ms=total,
+                postprocess_ms=post,
+                box_count=box_count,
+            )
             status = self._make_status(
                 state=RuntimeState.GREEN,
                 cause="WARMUP",
@@ -140,56 +159,90 @@ class YoloEdgeRuntimeProfiler:
                 },
                 low_postprocess_path=False,
                 enough=False,
+                window_size=len(self.window),
             )
             self._store_status(status)
             return status
 
-        # Only non-warmup frames enter the baseline.
-        self.window.append(
-            preprocess_ms=pre,
-            inference_ms=inf,
-            postprocess_ms=post,
-            total_ms=total,
-            box_count=box_count,
-        )
+        # ------------------------------------------------------------------
+        # 2) Baseline collection after warmup.
+        #    These frames enter baseline but do not trigger alerts.
+        # ------------------------------------------------------------------
+        if len(self.window) < max(1, self.config.min_window):
+            self.window.append(
+                preprocess_ms=pre,
+                inference_ms=inf,
+                postprocess_ms=post,
+                total_ms=total,
+                box_count=box_count,
+            )
+            rolling = self.window.stats()
+            enough_after_append = len(self.window) >= max(1, self.config.min_window)
 
-        enough = len(self.window) >= max(1, self.config.min_window)
+            status = self._make_status(
+                state=RuntimeState.GREEN,
+                cause="BASELINE_COLLECTION",
+                reason=f"Collecting baseline window: {len(self.window)}/{self.config.min_window}",
+                speed=speed,
+                stage_ratio=stage_ratio,
+                rolling=rolling,
+                box_count=box_count,
+                box_pressure_coeff=1.0,
+                conf_mean=conf_mean,
+                conf_min=conf_min,
+                conf_max=conf_max,
+                confidence_entropy=confidence_entropy,
+                classes=classes,
+                class_entropy=class_entropy,
+                residuals={
+                    "current_tail_coeff_p50": 1.0,
+                    "tail_latency_coeff_p95_p50": rolling["tail_coeff_p95_p50"],
+                    "tail_latency_coeff_p99_p50": rolling["tail_coeff_p99_p50"],
+                    "postprocess_spike_coeff": 1.0,
+                    "postprocess_ratio": float(stage_ratio["postprocess"]),
+                    "box_pressure_coeff": 1.0,
+                },
+                low_postprocess_path=False,
+                enough=enough_after_append,
+                window_size=len(self.window),
+            )
+            self._store_status(status)
+            return status
+
+        # ------------------------------------------------------------------
+        # 3) Classification uses the previous rolling baseline.
+        #    Current frame is appended only after classification.
+        # ------------------------------------------------------------------
         rolling = self.window.stats()
-        low_postprocess_path = enough and rolling["postprocess_p95"] <= self.config.low_postprocess_ms
+        low_postprocess_path = rolling["postprocess_p95"] <= self.config.low_postprocess_ms
 
         if low_postprocess_path and not self.low_postprocess_notice_printed:
             self.low_postprocess_notice_printed = True
             print(
                 "[INFO] Low-postprocess path detected. "
-                "Postprocess lag appears minimal; auditing total and stage tail latency instead."
+                "Postprocess lag appears minimal; auditing total/preprocess/inference tail latency instead."
             )
 
-        # Current-frame tail coefficient. This is the main tail trigger.
         current_tail_coeff = total / max(rolling["total_p50"], EPS)
 
-        # Postprocess spike coefficient is gated by current absolute postprocess latency.
-        # A 2x jump from 0.5 ms to 1.0 ms is not useful; a jump to 8-20 ms is.
-        post_median = rolling["postprocess_median"]
         if post >= self.config.min_postprocess_ms_for_spike:
-            postprocess_spike_coeff = post / max(post_median, EPS)
+            postprocess_spike_coeff = post / max(rolling["postprocess_median"], EPS)
         else:
             postprocess_spike_coeff = 1.0
 
-        box_median = rolling["box_median"]
-        if box_median > 0:
-            box_pressure_coeff = float(box_count) / max(float(box_median), EPS)
+        if rolling["box_median"] > 0:
+            box_pressure_coeff = float(box_count) / max(float(rolling["box_median"]), EPS)
         else:
             box_pressure_coeff = 1.0 if box_count == 0 else float(box_count)
 
         state, cause, reason = self._classify(
-            enough=enough,
             low_postprocess_path=low_postprocess_path,
-            rolling=rolling,
             stage_ratio=stage_ratio,
             postprocess_spike_coeff=postprocess_spike_coeff,
             current_total_ms=total,
             current_postprocess_ms=post,
             current_tail_coeff=current_tail_coeff,
+            box_count=box_count,
         )
 
         status = self._make_status(
@@ -216,36 +269,38 @@ class YoloEdgeRuntimeProfiler:
                 "box_pressure_coeff": float(box_pressure_coeff),
             },
             low_postprocess_path=low_postprocess_path,
-            enough=enough,
+            enough=True,
+            window_size=len(self.window),
         )
+
+        # Current frame becomes part of future baseline only after classification.
+        self.window.append(
+            preprocess_ms=pre,
+            inference_ms=inf,
+            postprocess_ms=post,
+            total_ms=total,
+            box_count=box_count,
+        )
+
         self._store_status(status)
         return status
 
     def _classify(
         self,
         *,
-        enough: bool,
         low_postprocess_path: bool,
-        rolling: Dict[str, float],
         stage_ratio: Dict[str, float],
         postprocess_spike_coeff: float,
         current_total_ms: float,
         current_postprocess_ms: float,
         current_tail_coeff: float,
+        box_count: int,
     ) -> Tuple[RuntimeState, str, str]:
-        if not enough:
-            return (
-                RuntimeState.GREEN,
-                "BASELINE_COLLECTION",
-                f"Collecting baseline window: {len(self.window)}/{self.config.min_window}",
-            )
-
-        post_ratio = stage_ratio["postprocess"]
         state = RuntimeState.GREEN
         cause = "STABLE_RUNTIME"
         reason = "Runtime appears stable within the current rolling window."
 
-        # Tail latency: current frame must be slow in absolute terms AND inflated relative to p50.
+        # Tail latency: current frame must be slow in absolute terms and inflated relative to p50.
         if current_total_ms >= self.config.min_tail_latency_ms:
             if current_tail_coeff >= self.config.red_tail_coeff:
                 state = max_state(state, RuntimeState.RED)
@@ -256,33 +311,48 @@ class YoloEdgeRuntimeProfiler:
                 cause = "TAIL_LATENCY_RISING"
                 reason = f"Current latency ({current_total_ms:.1f}ms) is {current_tail_coeff:.2f}x rolling p50."
 
-        # In end-to-end / low-postprocess paths, postprocess-specific alarms are de-emphasized.
-        if not low_postprocess_path:
-            # Postprocess dominance: only meaningful above an absolute postprocess floor.
+        post_ratio = stage_ratio["postprocess"]
+        post_box_ok = box_count >= self.config.min_box_count_for_postprocess_pressure
+
+        # Postprocess warnings require both:
+        #   - enough boxes to make postprocess/NMS pressure meaningful
+        #   - enough absolute postprocess time to avoid micro-jitter
+        if post_box_ok:
             if current_postprocess_ms >= self.config.min_postprocess_ms_for_pressure:
                 if post_ratio >= self.config.red_postprocess_ratio:
                     state = max_state(state, RuntimeState.RED)
                     cause = "POSTPROCESS_DOMINANT"
-                    reason = f"Postprocess is {post_ratio:.0%} of current total latency."
+                    reason = (
+                        f"Postprocess is {post_ratio:.0%} of current total latency "
+                        f"with {box_count} boxes."
+                    )
                 elif post_ratio >= self.config.yellow_postprocess_ratio and state != RuntimeState.RED:
                     state = max_state(state, RuntimeState.YELLOW)
                     cause = "POSTPROCESS_PRESSURE"
-                    reason = f"Postprocess is {post_ratio:.0%} of current total latency."
+                    reason = (
+                        f"Postprocess is {post_ratio:.0%} of current total latency "
+                        f"with {box_count} boxes."
+                    )
 
-            # Postprocess spike: also requires absolute postprocess latency to exceed the floor.
             if current_postprocess_ms >= self.config.min_postprocess_ms_for_spike:
                 if postprocess_spike_coeff >= self.config.red_postprocess_spike:
                     state = max_state(state, RuntimeState.RED)
                     cause = "POSTPROCESS_SPIKE"
-                    reason = f"Postprocess spike is {postprocess_spike_coeff:.2f}x rolling median."
+                    reason = (
+                        f"Postprocess spike is {postprocess_spike_coeff:.2f}x rolling median "
+                        f"with {box_count} boxes."
+                    )
                 elif postprocess_spike_coeff >= self.config.yellow_postprocess_spike and state != RuntimeState.RED:
                     state = max_state(state, RuntimeState.YELLOW)
                     cause = "POSTPROCESS_SPIKE_RISING"
-                    reason = f"Postprocess spike is {postprocess_spike_coeff:.2f}x rolling median."
-        else:
-            if state == RuntimeState.GREEN:
-                cause = "LOW_POSTPROCESS_PATH"
-                reason = "Postprocess is near-zero; auditing total/preprocess/inference tail latency."
+                    reason = (
+                        f"Postprocess spike is {postprocess_spike_coeff:.2f}x rolling median "
+                        f"with {box_count} boxes."
+                    )
+
+        if state == RuntimeState.GREEN and low_postprocess_path:
+            cause = "LOW_POSTPROCESS_PATH"
+            reason = "Postprocess is near-zero; auditing total/preprocess/inference tail latency."
 
         return state, cause, reason
 
@@ -306,11 +376,13 @@ class YoloEdgeRuntimeProfiler:
         residuals: Dict[str, float],
         low_postprocess_path: bool,
         enough: bool,
+        window_size: int,
     ) -> RuntimeStatus:
         pre = speed["preprocess"]
         inf = speed["inference"]
         post = speed["postprocess"]
         total = speed["total"]
+
         return RuntimeStatus(
             frame_index=self.frame_index,
             state=state,
@@ -348,7 +420,7 @@ class YoloEdgeRuntimeProfiler:
             residuals=residuals,
             low_postprocess_path=low_postprocess_path,
             enough_samples=enough,
-            window_size=len(self.window),
+            window_size=window_size,
             raw_speed=dict(speed),
         )
 
@@ -421,6 +493,7 @@ class YoloEdgeRuntimeProfiler:
 
         state_counts: Dict[str, int] = {}
         cause_counts: Dict[str, int] = {}
+
         for r in self.records:
             state_counts[r.state.value] = state_counts.get(r.state.value, 0) + 1
             cause_counts[r.dominant_cause] = cause_counts.get(r.dominant_cause, 0) + 1
