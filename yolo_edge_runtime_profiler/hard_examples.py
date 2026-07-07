@@ -12,6 +12,13 @@ import numpy as np
 from .status import RuntimeState, RuntimeStatus
 
 
+DEFAULT_TRIGGER_CAUSES: Tuple[str, ...] = (
+    "TAIL_LATENCY_SPIKE",
+    "POSTPROCESS_SPIKE",
+    "POSTPROCESS_DOMINANT",
+)
+
+
 @dataclass
 class CaptureResult:
     saved: bool
@@ -27,43 +34,34 @@ class LocalHardExampleConfig:
     """
     Local-first hard-example capture policy.
 
-    The recorder is deliberately local-only. It never uploads frames.
-    Defaults are conservative to avoid saving micro-jitter and low-value frames.
+    Defaults are intentionally conservative:
+      - RED only
+      - meaningful causes only
+      - minimum box count
+      - cooldown
+      - item limit
+
+    This prevents sparse-scene micro-jitter from creating low-value captures.
     """
 
     output_dir: str = "hard_examples"
     enabled: bool = True
 
-    # Selection mode:
-    #   pressure_only: capture by runtime state/cause only
-    #   confidence_only: capture by confidence uncertainty only
-    #   pressure_or_confidence: capture either signal
-    #   pressure_and_confidence: require both signals
     selection_mode: str = "pressure_or_confidence"
 
-    # Conservative default: capture only high-severity runtime events.
     trigger_states: Tuple[str, ...] = ("RED",)
-    trigger_causes: Tuple[str, ...] = (
-        "TAIL_LATENCY_SPIKE",
-        "POSTPROCESS_SPIKE",
-        "POSTPROCESS_DOMINANT",
-    )
+    trigger_causes: Tuple[str, ...] = DEFAULT_TRIGGER_CAUSES
 
-    # Optional confidence/uncertainty triggers. Disabled when None.
     min_confidence_entropy: Optional[float] = None
     max_confidence_mean: Optional[float] = None
 
-    # Minimum detections for confidence-triggered and pressure-triggered capture.
-    # This filters out single-box micro-jitter that is not a useful hard example.
     min_box_count: int = 5
     min_box_count_for_pressure: int = 5
 
-    # Safety guards to avoid turning capture into a new I/O bottleneck.
     cooldown_sec: float = 2.0
     max_items: int = 50
     require_enough_samples: bool = True
 
-    # Image persistence.
     image_ext: str = "jpg"
     save_image: bool = True
     save_metadata: bool = True
@@ -71,15 +69,13 @@ class LocalHardExampleConfig:
 
 class LocalHardExampleRecorder:
     """
-    Local-first hard-example recorder for YERP.
+    Local-first hard-example recorder.
 
-    It converts runtime pressure and optional confidence uncertainty into a
-    local data-selection signal. It saves:
+    It saves:
       - current frame image, when available
-      - sidecar metadata JSON with the full RuntimeStatus and capture policy
+      - sidecar JSON metadata with full RuntimeStatus and capture policy
 
-    It does not upload data. Users can later connect the local folder to their
-    private dataset server, labeling system, or training workflow.
+    It never uploads data.
     """
 
     def __init__(
@@ -104,14 +100,17 @@ class LocalHardExampleRecorder:
                 enabled=enabled,
                 selection_mode=selection_mode,
                 trigger_states=tuple(trigger_states),
-                trigger_causes=tuple(trigger_causes) if trigger_causes is not None else LocalHardExampleConfig.trigger_causes,
+                trigger_causes=tuple(trigger_causes) if trigger_causes is not None else DEFAULT_TRIGGER_CAUSES,
                 min_confidence_entropy=min_confidence_entropy,
                 max_confidence_mean=max_confidence_mean,
                 min_box_count=int(min_box_count),
-                min_box_count_for_pressure=int(min_box_count_for_pressure if min_box_count_for_pressure is not None else min_box_count),
+                min_box_count_for_pressure=int(
+                    min_box_count_for_pressure if min_box_count_for_pressure is not None else min_box_count
+                ),
                 cooldown_sec=float(cooldown_sec),
                 max_items=int(max_items),
             )
+
         self.config = config
         self.output_dir = Path(self.config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -153,6 +152,7 @@ class LocalHardExampleRecorder:
 
         image_saved = False
         image_error = ""
+
         if self.config.save_image and frame is not None:
             try:
                 image_saved = _write_image(image_path, frame)
@@ -173,7 +173,10 @@ class LocalHardExampleRecorder:
                 source_info=source_info or {},
                 extra_metadata=extra_metadata or {},
             )
-            meta_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            meta_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
             metadata_saved = True
 
         self.saved_count += 1
@@ -199,7 +202,7 @@ class LocalHardExampleRecorder:
             selected = confidence["active"]
         elif mode == "pressure_and_confidence":
             selected = pressure["active"] and confidence["active"]
-        else:  # pressure_or_confidence
+        else:
             selected = pressure["active"] or confidence["active"]
 
         if selected:
@@ -224,10 +227,13 @@ class LocalHardExampleRecorder:
         state = _state_value(status.state)
         cause = str(status.dominant_cause or "")
         box_count = int(status.output_pressure.get("box_count", 0) or 0)
+
         state_match = state in set(self.config.trigger_states)
-        cause_match = (not self.config.trigger_causes) or cause in set(self.config.trigger_causes)
+        cause_match = cause in set(self.config.trigger_causes)
         box_count_match = box_count >= int(self.config.min_box_count_for_pressure)
+
         active = state_match and cause_match and box_count_match
+
         return {
             "active": bool(active),
             "state": state,
@@ -247,8 +253,10 @@ class LocalHardExampleRecorder:
         conf_mean = float(status.output_pressure.get("confidence_mean", 0.0) or 0.0)
 
         box_count_match = box_count >= int(self.config.min_box_count)
+
         entropy_active = False
         mean_active = False
+
         if box_count_match:
             if self.config.min_confidence_entropy is not None:
                 entropy_active = conf_entropy >= float(self.config.min_confidence_entropy)
@@ -313,7 +321,6 @@ def _write_image(path: Path, frame: Any) -> bool:
     if arr.size == 0:
         return False
 
-    # First try OpenCV. Ultralytics normally has cv2 available, and orig_img is often BGR.
     try:
         import cv2  # type: ignore
 
@@ -324,22 +331,22 @@ def _write_image(path: Path, frame: Any) -> bool:
     except Exception:
         pass
 
-    # Fallback to PIL for RGB-like arrays.
     try:
         from PIL import Image  # type: ignore
 
         arr2 = np.asarray(arr)
         if arr2.dtype != np.uint8:
             arr2 = np.clip(arr2, 0, 255).astype(np.uint8)
+
         if arr2.ndim == 2:
             img = Image.fromarray(arr2)
         elif arr2.ndim == 3 and arr2.shape[2] in (3, 4):
             img = Image.fromarray(arr2)
         else:
             return False
+
         path.parent.mkdir(parents=True, exist_ok=True)
         img.save(str(path))
         return True
     except Exception:
         return False
-
