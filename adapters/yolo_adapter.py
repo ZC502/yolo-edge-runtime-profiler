@@ -19,6 +19,33 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+        if math.isfinite(v):
+            return v
+        return None
+    except Exception:
+        return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _optional_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value)
+
+
 def _to_float_list(x: Any) -> List[float]:
     try:
         if hasattr(x, "detach"):
@@ -104,6 +131,7 @@ def _extract_output_pressure(result: Any) -> Dict[str, Any]:
             "confidence_entropy": 0.0,
             "class_count": 0,
             "class_entropy": 0.0,
+            "scene_complexity": 0.0,
         }
 
     try:
@@ -129,8 +157,8 @@ def _extract_output_pressure(result: Any) -> Dict[str, Any]:
     class_entropy = _entropy_from_labels(cls_values)
     class_count = int(len(set(cls_values))) if cls_values else 0
 
-    # A generic scene-complexity proxy.
-    # Not YOLO-specific in name, but for YOLO we derive it from confidence entropy + target count.
+    # Generic scene-complexity proxy.
+    # For YOLO this combines confidence entropy and target density.
     scene_complexity = float(confidence_entropy + 0.25 * math.log1p(max(0, target_count)))
 
     return {
@@ -158,6 +186,8 @@ def context_from_yolo_result(
     decode_ms: Optional[float] = None,
     write_ms: Optional[float] = None,
     estimated_backlog_count: Optional[int] = None,
+    ros_meta: Optional[Dict[str, Any]] = None,
+    system_context: Optional[Dict[str, Any]] = None,
     custom_meta: Optional[Dict[str, Any]] = None,
 ) -> FrameInferenceContext:
     """
@@ -165,12 +195,28 @@ def context_from_yolo_result(
 
     This is the only place that should understand Ultralytics result objects.
     The stutter engine and report generator should stay model-agnostic.
+
+    ros_meta is optional and intentionally loose. A future ROS node can pass values such as:
+      {
+        "ros_topic": "/camera/image_raw",
+        "ros_frame_id": "camera",
+        "ros_header_stamp_sec": 123.456,
+        "ros_arrival_time_sec": 123.490,
+        "ros_arrival_delay_ms": 34.0,
+        "ros_publish_interval_ms": 33.3,
+        "ros_callback_ms": 6.1,
+        "ros_executor_delay_ms": 12.0,
+        "ros_tf_wait_ms": 3.5,
+        "ros_qos_depth": 10,
+        "ros_dropped_frames_estimate": 2,
+      }
     """
 
     speed = _extract_speed(result)
     pressure = _extract_output_pressure(result)
 
     raw_frame = getattr(result, "orig_img", None)
+    ros = ros_meta or {}
 
     meta = {
         "adapter": "ultralytics_yolo",
@@ -204,6 +250,18 @@ def context_from_yolo_result(
         estimated_backlog_count=estimated_backlog_count,
         target_count=int(pressure.get("target_count", 0)),
         scene_complexity=float(pressure.get("scene_complexity", 0.0)),
+        ros_topic=_optional_str(ros.get("ros_topic", ""), ""),
+        ros_frame_id=_optional_str(ros.get("ros_frame_id", ""), ""),
+        ros_header_stamp_sec=_optional_float(ros.get("ros_header_stamp_sec")),
+        ros_arrival_time_sec=_optional_float(ros.get("ros_arrival_time_sec")),
+        ros_arrival_delay_ms=_optional_float(ros.get("ros_arrival_delay_ms")),
+        ros_publish_interval_ms=_optional_float(ros.get("ros_publish_interval_ms")),
+        ros_callback_ms=_optional_float(ros.get("ros_callback_ms")),
+        ros_executor_delay_ms=_optional_float(ros.get("ros_executor_delay_ms")),
+        ros_tf_wait_ms=_optional_float(ros.get("ros_tf_wait_ms")),
+        ros_qos_depth=_optional_int(ros.get("ros_qos_depth")),
+        ros_dropped_frames_estimate=_optional_int(ros.get("ros_dropped_frames_estimate")),
+        system_context=dict(system_context or {}),
         raw_frame=raw_frame,
         custom_meta=meta,
     )
