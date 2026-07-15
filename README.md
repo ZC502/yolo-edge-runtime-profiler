@@ -33,7 +33,9 @@ Markdown / JSON report
 
 ![Dense Crowd Stutter Demo](assets/dense_crowd_stutter_demo.jpg)
 
-The image above is from a dense pedestrian scene. This is the kind of input where average FPS can look fine, while individual frames still trigger postprocess pressure, micro-stutters, or control-loop risk.
+The image above is from a pedestrian scene. This is the kind of input where average FPS can look fine, while individual frames still trigger postprocess pressure, micro-stutters, or control-loop risk(YOLOv8s).
+
+**Why is this frame RED?** To the naked eye, it's just a standard detection. But YERP's JSON trace reveals: this frame generated 18 bounding boxes with high class entropy, pushing the Postprocess/NMS runtime to 28% of total latency . The system flagged it as `POSTPROCESS_DOMINANT`, isolating the exact moment pipeline pressure spiked.
 
 Below is a YERP-style field diagnostic report generated from a 300-frame YOLOv8s dense crowd run.
 
