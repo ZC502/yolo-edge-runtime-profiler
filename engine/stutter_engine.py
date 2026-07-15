@@ -42,6 +42,19 @@ class StutterEngineConfig:
     io_wait_yellow_ms: float = 20.0
     io_wait_red_ms: float = 50.0
 
+    # ROS / robotics diagnostics
+    # These defaults are intentionally conservative. Tune them for the control-loop budget.
+    ros_executor_yellow_ms: float = 10.0
+    ros_executor_red_ms: float = 30.0
+    ros_callback_yellow_ms: float = 10.0
+    ros_callback_red_ms: float = 30.0
+    ros_tf_wait_yellow_ms: float = 10.0
+    ros_tf_wait_red_ms: float = 30.0
+    ros_arrival_delay_yellow_ms: float = 50.0
+    ros_arrival_delay_red_ms: float = 100.0
+    ros_drop_yellow_count: int = 1
+    ros_drop_red_count: int = 5
+
     # Baseline hygiene
     add_yellow_to_baseline: bool = False
     add_red_to_baseline: bool = False
@@ -194,7 +207,10 @@ class StutterEngine:
 
         def promote(new_state: str, new_cause: str, new_severity: float) -> None:
             nonlocal state, cause, severity
-            if _state_rank(new_state) > _state_rank(state) or new_severity > severity:
+            # Higher state always wins. Within the same state, higher severity wins.
+            if _state_rank(new_state) > _state_rank(state) or (
+                _state_rank(new_state) == _state_rank(state) and new_severity > severity
+            ):
                 state = new_state
                 cause = new_cause
                 severity = float(new_severity)
@@ -209,7 +225,13 @@ class StutterEngine:
         elif input_block_ms >= cfg.io_wait_yellow_ms:
             promote("YELLOW", "IO_STREAM_BLOCKING", input_block_ms)
 
-        # 2. Cascade / queue delay.
+        # 2. ROS / robotics blocking.
+        # This is the key layer that separates YERP from a simple CV timing script:
+        # it can surface control-loop adjacent delays such as executor scheduling,
+        # blocking callbacks, TF waits, message arrival delay, and QoS backlog/drop.
+        self._classify_ros(ctx, promote)
+
+        # 3. Cascade / queue delay.
         backlog = int(ctx.estimated_backlog_count or 0)
         previous_slow_count = sum(1 for x in self._recent_slow if x)
 
@@ -267,6 +289,55 @@ class StutterEngine:
                 cause = "SYSTEM_WIDE_SLOWDOWN"
 
         return state, cause, severity
+
+    def _classify_ros(self, ctx: FrameInferenceContext, promote) -> None:
+        """
+        Promote ROS/robotics causes based on reserved ROS timing fields.
+
+        These fields are optional. If a non-ROS pipeline does not populate them,
+        this method is effectively a no-op.
+        """
+        cfg = self.config
+
+        ros_executor_ms = _none_to_zero(ctx.ros_executor_delay_ms)
+        ros_callback_ms = _none_to_zero(ctx.ros_callback_ms)
+        ros_tf_wait_ms = _none_to_zero(ctx.ros_tf_wait_ms)
+        ros_arrival_delay_ms = _none_to_zero(ctx.ros_arrival_delay_ms)
+
+        try:
+            ros_dropped = int(ctx.ros_dropped_frames_estimate or 0)
+        except Exception:
+            ros_dropped = 0
+
+        # Executor scheduling delay: the frame waits before the callback actually runs.
+        if ros_executor_ms >= cfg.ros_executor_red_ms:
+            promote("RED", "ROS_EXECUTOR_DELAY", ros_executor_ms)
+        elif ros_executor_ms >= cfg.ros_executor_yellow_ms:
+            promote("YELLOW", "ROS_EXECUTOR_DELAY", ros_executor_ms)
+
+        # Callback blocking: heavy work inside callback or callback group contention.
+        if ros_callback_ms >= cfg.ros_callback_red_ms:
+            promote("RED", "ROS_CALLBACK_BLOCKING", ros_callback_ms)
+        elif ros_callback_ms >= cfg.ros_callback_yellow_ms:
+            promote("YELLOW", "ROS_CALLBACK_BLOCKING", ros_callback_ms)
+
+        # TF wait: transform lookup blocks the frame path.
+        if ros_tf_wait_ms >= cfg.ros_tf_wait_red_ms:
+            promote("RED", "ROS_TF_WAIT", ros_tf_wait_ms)
+        elif ros_tf_wait_ms >= cfg.ros_tf_wait_yellow_ms:
+            promote("YELLOW", "ROS_TF_WAIT", ros_tf_wait_ms)
+
+        # Message arrival delay: transport / DDS / camera driver / network jitter.
+        if ros_arrival_delay_ms >= cfg.ros_arrival_delay_red_ms:
+            promote("RED", "ROS_MESSAGE_ARRIVAL_DELAY", ros_arrival_delay_ms)
+        elif ros_arrival_delay_ms >= cfg.ros_arrival_delay_yellow_ms:
+            promote("YELLOW", "ROS_MESSAGE_ARRIVAL_DELAY", ros_arrival_delay_ms)
+
+        # QoS / backlog / drops: stale frame processing risk.
+        if ros_dropped >= cfg.ros_drop_red_count:
+            promote("RED", "ROS_QOS_DROP_OR_BACKLOG", float(ros_dropped))
+        elif ros_dropped >= cfg.ros_drop_yellow_count:
+            promote("YELLOW", "ROS_QOS_DROP_OR_BACKLOG", float(ros_dropped))
 
     def _build_evidence(
         self,
@@ -351,6 +422,46 @@ class StutterEngine:
                 "Total runtime increased without one clear stage dominating. Check background processes, CPU/GPU/NPU contention, thermal throttling, and power limits."
             )
 
+        elif cause == "ROS_EXECUTOR_DELAY":
+            suggestions.append(
+                "Likely ROS executor delay. Check executor type, callback group design, long-running callbacks, and whether image processing blocks the executor thread."
+            )
+            suggestions.append(
+                "If using rclpy/rclcpp with heavy image processing, consider a MultiThreadedExecutor, separate callback groups, or moving CV work to a bounded worker queue."
+            )
+
+        elif cause == "ROS_CALLBACK_BLOCKING":
+            suggestions.append(
+                "Likely ROS callback blocking. Move heavy CV work out of the subscription callback or use a bounded worker queue."
+            )
+            suggestions.append(
+                "Avoid doing synchronous disk writes, blocking TF lookups, or long GPU synchronization directly inside the image callback."
+            )
+
+        elif cause == "ROS_TF_WAIT":
+            suggestions.append(
+                "Likely TF wait blocking. Check transform availability, timeout settings, and whether TF lookup is blocking the frame callback."
+            )
+            suggestions.append(
+                "Prefer non-blocking transform checks or cache transforms outside the hot image-processing path."
+            )
+
+        elif cause == "ROS_MESSAGE_ARRIVAL_DELAY":
+            suggestions.append(
+                "Likely ROS message arrival delay. Check camera driver timing, DDS transport, QoS settings, and network jitter."
+            )
+            suggestions.append(
+                "Compare header timestamps with local arrival timestamps to separate transport delay from CV inference delay."
+            )
+
+        elif cause == "ROS_QOS_DROP_OR_BACKLOG":
+            suggestions.append(
+                "ROS QoS drop or backlog is suspected. Check QoS depth, reliability mode, queue size, and whether stale frames are being processed."
+            )
+            suggestions.append(
+                "For real-time CV, consider a bounded queue and dropping stale frames instead of processing old frames."
+            )
+
         else:
             suggestions.append(
                 "Inspect the frame evidence and compare it with nearby normal frames. If this is repeatable, test with a lower resolution and a smaller model."
@@ -393,6 +504,11 @@ class StutterEngine:
             "target_count": ctx.target_count,
             "scene_complexity": ctx.scene_complexity,
             "source_type": ctx.source_type,
+            "ros_callback_ms": ctx.ros_callback_ms,
+            "ros_executor_delay_ms": ctx.ros_executor_delay_ms,
+            "ros_tf_wait_ms": ctx.ros_tf_wait_ms,
+            "ros_arrival_delay_ms": ctx.ros_arrival_delay_ms,
+            "ros_dropped_frames_estimate": ctx.ros_dropped_frames_estimate,
         })
 
 
