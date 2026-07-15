@@ -105,8 +105,6 @@ def _extract_speed(result: Any) -> Dict[str, float]:
     inference = _safe_float(raw.get("inference", 0.0))
     postprocess = _safe_float(raw.get("postprocess", 0.0))
 
-    # Ultralytics usually provides these three stages.
-    # If total is not present, use the sum.
     total = _safe_float(
         raw.get("total", preprocess + inference + postprocess),
         preprocess + inference + postprocess,
@@ -157,8 +155,6 @@ def _extract_output_pressure(result: Any) -> Dict[str, Any]:
     class_entropy = _entropy_from_labels(cls_values)
     class_count = int(len(set(cls_values))) if cls_values else 0
 
-    # Generic scene-complexity proxy.
-    # For YOLO this combines confidence entropy and target density.
     scene_complexity = float(confidence_entropy + 0.25 * math.log1p(max(0, target_count)))
 
     return {
@@ -194,22 +190,7 @@ def context_from_yolo_result(
     Convert an Ultralytics YOLO result into YERP's generic FrameInferenceContext.
 
     This is the only place that should understand Ultralytics result objects.
-    The stutter engine and report generator should stay model-agnostic.
-
-    ros_meta is optional and intentionally loose. A future ROS node can pass values such as:
-      {
-        "ros_topic": "/camera/image_raw",
-        "ros_frame_id": "camera",
-        "ros_header_stamp_sec": 123.456,
-        "ros_arrival_time_sec": 123.490,
-        "ros_arrival_delay_ms": 34.0,
-        "ros_publish_interval_ms": 33.3,
-        "ros_callback_ms": 6.1,
-        "ros_executor_delay_ms": 12.0,
-        "ros_tf_wait_ms": 3.5,
-        "ros_qos_depth": 10,
-        "ros_dropped_frames_estimate": 2,
-      }
+    The stutter engine and report generator stay model-agnostic.
     """
 
     speed = _extract_speed(result)
