@@ -38,9 +38,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=int, default=100)
     parser.add_argument("--min-window", type=int, default=10)
 
+    # Threshold knobs. These make YERP adaptable to different real-time budgets and scenes.
     parser.add_argument("--min-tail-latency-ms", type=float, default=30.0)
     parser.add_argument("--min-postprocess-ms", type=float, default=3.0)
     parser.add_argument("--min-target-count-postprocess", type=int, default=5)
+    parser.add_argument("--yellow-slowdown-ratio", type=float, default=2.0)
+    parser.add_argument("--red-slowdown-ratio", type=float, default=4.0)
+    parser.add_argument("--yellow-robust-z", type=float, default=3.5)
+    parser.add_argument("--red-robust-z", type=float, default=6.0)
+    parser.add_argument("--yellow-postprocess-ratio", type=float, default=0.30)
+    parser.add_argument("--red-postprocess-ratio", type=float, default=0.50)
 
     parser.add_argument(
         "--source-type",
@@ -54,9 +61,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Source FPS used to estimate input_interval_ms. "
-            "For file replay, this is read from the video if omitted. "
-            "For RTSP/camera, pass this when you know the camera FPS."
+            "Nominal source FPS. For file replay, this is used as the video cadence. "
+            "For stream/camera, it is only used as a first-frame fallback and expected reference; "
+            "observed arrival intervals are still measured to preserve jitter."
         ),
     )
 
@@ -141,6 +148,42 @@ def input_interval_ms_from_fps(fps: Optional[float]) -> Optional[float]:
     return 1000.0 / float(fps)
 
 
+def build_config(args: argparse.Namespace, expected_input_fps: Optional[float]) -> StutterEngineConfig:
+    if args.demo_mode:
+        # Recording/demo profile: intentionally more sensitive for short demos.
+        min_tail_latency_ms = 15.0
+        min_postprocess_ms = 1.0
+        min_target_count = 8
+        yellow_postprocess_ratio = 0.20
+        red_postprocess_ratio = 0.45
+        yellow_slowdown_ratio = min(args.yellow_slowdown_ratio, 1.50)
+        red_slowdown_ratio = min(args.red_slowdown_ratio, 3.00)
+    else:
+        min_tail_latency_ms = args.min_tail_latency_ms
+        min_postprocess_ms = args.min_postprocess_ms
+        min_target_count = args.min_target_count_postprocess
+        yellow_postprocess_ratio = args.yellow_postprocess_ratio
+        red_postprocess_ratio = args.red_postprocess_ratio
+        yellow_slowdown_ratio = args.yellow_slowdown_ratio
+        red_slowdown_ratio = args.red_slowdown_ratio
+
+    return StutterEngineConfig(
+        window_size=args.window_size,
+        min_window=args.min_window,
+        warmup_frames=args.warmup_frames,
+        min_tail_latency_ms=min_tail_latency_ms,
+        min_postprocess_ms=min_postprocess_ms,
+        min_target_count_for_postprocess=min_target_count,
+        yellow_postprocess_ratio=yellow_postprocess_ratio,
+        red_postprocess_ratio=red_postprocess_ratio,
+        yellow_slowdown_ratio=yellow_slowdown_ratio,
+        red_slowdown_ratio=red_slowdown_ratio,
+        yellow_robust_z=args.yellow_robust_z,
+        red_robust_z=args.red_robust_z,
+        expected_input_fps=expected_input_fps,
+    )
+
+
 def main() -> int:
     args = parse_args()
 
@@ -153,34 +196,11 @@ def main() -> int:
     input_fps = resolve_input_fps(source, source_type, args.input_fps)
     expected_input_fps = args.expected_input_fps or input_fps
 
-    # For file replay, input_interval_ms should be the original video cadence,
-    # not the processing-loop interval. Otherwise queue/backlog diagnosis is misleading.
+    # For file replay, the real-time budget is the original video cadence.
+    # For stream/camera, the same value is only a nominal reference; observed intervals are still measured.
     nominal_input_interval_ms = input_interval_ms_from_fps(input_fps)
 
-    if args.demo_mode:
-        min_tail_latency_ms = 15.0
-        min_postprocess_ms = 1.0
-        min_target_count = 8
-        yellow_postprocess_ratio = 0.20
-        red_postprocess_ratio = 0.45
-    else:
-        min_tail_latency_ms = args.min_tail_latency_ms
-        min_postprocess_ms = args.min_postprocess_ms
-        min_target_count = args.min_target_count_postprocess
-        yellow_postprocess_ratio = 0.30
-        red_postprocess_ratio = 0.50
-
-    config = StutterEngineConfig(
-        window_size=args.window_size,
-        min_window=args.min_window,
-        warmup_frames=args.warmup_frames,
-        min_tail_latency_ms=min_tail_latency_ms,
-        min_postprocess_ms=min_postprocess_ms,
-        min_target_count_for_postprocess=min_target_count,
-        yellow_postprocess_ratio=yellow_postprocess_ratio,
-        red_postprocess_ratio=red_postprocess_ratio,
-        expected_input_fps=expected_input_fps,
-    )
+    config = build_config(args, expected_input_fps)
 
     print("[YERP] Edge CV Stutter Frame Profiler")
     print(f"[YERP] model:       {args.model}")
@@ -194,6 +214,12 @@ def main() -> int:
     if source_type == "file_replay" and nominal_input_interval_ms is None:
         print("[WARN] Could not determine video FPS. Queue/backlog diagnosis will be limited.")
         print("       Pass --input-fps 25 or --input-fps 30 if you know the video FPS.")
+        print()
+
+    if source_type != "file_replay" and nominal_input_interval_ms is not None:
+        print("[YERP] Stream/camera mode:")
+        print("       --input-fps is treated as nominal reference only.")
+        print("       Observed arrival interval is still measured to preserve input jitter.")
         print()
 
     model = YOLO(args.model)
@@ -221,16 +247,18 @@ def main() -> int:
             processed_interval_ms = (now - last_loop_ts) * 1000.0
         last_loop_ts = now
 
-        # For local files, use the original video cadence.
-        # For stream/camera, best-effort use observed arrival interval unless user provided --input-fps.
+        # Input cadence policy:
+        # - file_replay: trust the video FPS and use the nominal frame interval.
+        # - stream/camera/ros_topic: use observed arrival interval to preserve network/IO jitter.
+        #   --input-fps is only used as the first-frame fallback and expected reference.
         if source_type == "file_replay":
-            input_interval_ms = nominal_input_interval_ms
-        elif nominal_input_interval_ms is not None:
             input_interval_ms = nominal_input_interval_ms
         else:
             input_interval_ms = None
             if last_arrival_ts is not None:
                 input_interval_ms = (now - last_arrival_ts) * 1000.0
+            elif nominal_input_interval_ms is not None:
+                input_interval_ms = nominal_input_interval_ms
         last_arrival_ts = now
 
         ros_meta = {}
@@ -256,16 +284,28 @@ def main() -> int:
                 "max_det": args.max_det,
                 "input_fps": input_fps,
                 "expected_input_fps": expected_input_fps,
+                "nominal_input_interval_ms": nominal_input_interval_ms,
+                "input_interval_policy": (
+                    "video_fps_for_file_replay"
+                    if source_type == "file_replay"
+                    else "observed_arrival_interval_for_stream"
+                ),
+                "demo_mode": bool(args.demo_mode),
             },
         )
 
         event = engine.process(ctx)
 
         if event:
+            budget_ms = input_interval_ms_from_fps(expected_input_fps)
+            budget = f"{budget_ms:.2f}ms" if budget_ms else "n/a"
+            breach = "YES" if budget_ms and event.total_ms > budget_ms else "NO" if budget_ms else "n/a"
+
             print(
                 f"[{event.state}] frame={event.frame_id} "
                 f"cause={event.cause} "
                 f"total={event.total_ms:.2f}ms "
+                f"budget={budget} breach={breach} "
                 f"baseline={event.local_baseline_ms:.2f}ms "
                 f"slowdown={event.slowdown_ratio:.2f}x "
                 f"targets={event.target_count}"
@@ -284,6 +324,28 @@ def main() -> int:
     summary["input_fps"] = input_fps
     summary["input_interval_ms"] = nominal_input_interval_ms
     summary["expected_input_fps"] = expected_input_fps
+    summary["real_time_budget_ms"] = input_interval_ms_from_fps(expected_input_fps)
+    summary["thresholds"] = {
+        "min_tail_latency_ms": config.min_tail_latency_ms,
+        "min_postprocess_ms": config.min_postprocess_ms,
+        "min_target_count_for_postprocess": config.min_target_count_for_postprocess,
+        "yellow_slowdown_ratio": config.yellow_slowdown_ratio,
+        "red_slowdown_ratio": config.red_slowdown_ratio,
+        "yellow_postprocess_ratio": config.yellow_postprocess_ratio,
+        "red_postprocess_ratio": config.red_postprocess_ratio,
+        "yellow_robust_z": config.yellow_robust_z,
+        "red_robust_z": config.red_robust_z,
+    }
+    summary["notes"] = {
+        "severity_vs_budget": (
+            "RED/YELLOW are diagnostic severity levels. A RED event may indicate structural risk "
+            "such as postprocess dominance even when it does not breach the current real-time budget."
+        ),
+        "input_interval_policy": (
+            "file_replay uses video FPS as input cadence; stream/camera uses observed arrival intervals "
+            "so RTSP/network/IO jitter is not hidden by --input-fps."
+        ),
+    }
 
     export_json(
         args.json,
