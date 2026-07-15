@@ -1,97 +1,168 @@
-# YOLO Edge-Runtime Profiler
+# YERP: Edge CV Stutter Diagnostics
 
-**Stop looking only at average FPS.**  
-**Find the frames that make YOLO unstable at runtime.**
+**Find the exact frames that make your Edge CV / ROS pipeline stutter — and know why.**
 
-YERP is a lightweight runtime profiler for Ultralytics YOLO deployments.
+YERP is a lightweight, local-first stutter diagnostics tool for edge computer vision and robotics deployments.
 
-It reads the official `Results.speed` output and tracks:
+It does **not** just report FPS. It helps answer the field-debugging questions that actually matter:
 
-- tail latency
-- preprocess / inference / postprocess imbalance
-- postprocess spikes
-- output pressure
-- confidence entropy
-- box-count pressure
+- Which frame stuttered?
+- Was it inference, postprocess/NMS, input stream jitter, queue backlog, or ROS scheduling?
+- Did the frame breach the real-time budget?
+- What should the engineer try next?
 
-When runtime pressure appears, YERP can locally save the frame and a JSON sidecar with the full runtime context.
-
-This turns edge-runtime instability into a hard-example mining signal for future labeling, debugging, and active learning.
-
-*_YERP does **not** modify YOLO, retrain models, hook neural-network layers, require ROS 2, or upload your data_.*
-
-## Runtime-Pressure + Confidence-Aware Hard Example Capture
-
-Most active-learning pipelines sample frames from model uncertainty alone.
-
-YERP adds a deployment signal:
+YERP currently ships with an Ultralytics YOLO adapter, but its core diagnostic path is model-agnostic:
 
 ```text
-model uncertainty
-        +
-edge-runtime pressure
+CV model / detector / tracker
+        ↓
+Adapter
+        ↓
+FrameInferenceContext
+        ↓
+StutterEngine
+        ↓
+StutterEvent
+        ↓
+Markdown / JSON report
 ```
 
-Instead of saving random frames, YERP captures frames that are associated with:
-- tail-latency spikes
-- postprocess pressure
-- stage imbalance
-- dense detection output
-- high confidence entropy
-- low-confidence detections
+---
 
-Each captured frame is saved locally with a JSON sidecar:
-```
-hard_examples/
-  frame_000123_RED_POSTPROCESS_SPIKE.jpg
-  frame_000123_RED_POSTPROCESS_SPIKE.json
-```
+## Dense Scene Demo: YERP Finds the Stutter Frames
 
-The JSON sidecar contains:
-- YOLO stage timing
-- rolling p50 / p95 / p99 latency
-- dominant runtime cause
-- box count
-- confidence statistics
-- entropy metrics
-- capture policy
-YERP is local-first. It does not upload images or metadata.
+![Dense Crowd Stutter Demo](assets/dense_crowd_stutter_demo.jpg)
 
-## Why This Exists
+The image above is from a dense pedestrian scene. This is the kind of input where average FPS can look fine, while individual frames still trigger postprocess pressure, micro-stutters, or control-loop risk.
 
-Traditional YOLO benchmarking usually reports average speed or average FPS. That is useful, but it can hide tail latency.
+Below is a YERP-style field diagnostic report generated from a 300-frame YOLOv8s dense crowd run.
 
-In real deployments, the failure mode is often not:
+> Note: `RED` / `YELLOW` are diagnostic severity levels.  
+> A `RED` event can indicate structural risk, such as postprocess dominance or tail-latency spike, even if the frame does not breach the current real-time budget.
+
+---
+
+## YERP Field Diagnostic Report
+
+### Executive Summary
+
+| Metric | Value |
+|---|---:|
+| Frames analyzed | 300 |
+| RED frames | 12 |
+| YELLOW frames | 244 |
+| GREEN frames | 44 |
+| Dominant issue | `POSTPROCESS_PRESSURE` |
+| Main field suggestion | Tune postprocess/NMS, confidence threshold, `max_det`, and input resolution before blaming the model backbone |
+
+### What this means
+
+For a project manager:
+
+> The model is not simply “slow.”  
+> The pipeline becomes unstable under dense-scene pressure.  
+> The next debugging step is not random model swapping — it is targeted postprocess and deployment-path diagnosis.
+
+For a field engineer:
+
+> Dense targets are pushing the postprocess path into a risky state.  
+> Reproduce with fixed video/model, then sweep `conf`, `max_det`, and `imgsz`.
+
+---
+
+## Top Stutter Events
+
+| Rank | Frame | Severity | Stutter Type | Likely Root Cause | Total Latency | Real-time Budget | Budget Breach | Slowdown | Suggested Action |
+|---:|---:|---|---|---|---:|---:|---|---:|---|
+| 1 | 269 | RED | `TAIL_LATENCY_SPIKE` | This frame has a latency spike against the local baseline. | 12.55 ms | 40.00 ms | NO | 1.53x | Check system preemption, throttling, and dense-scene pressure. |
+| 2 | 264 | RED | `POSTPROCESS_DOMINANT` | Postprocess dominates this frame's runtime. | 9.59 ms | 40.00 ms | NO | 1.19x | Optimize postprocess/NMS before changing the model backbone. |
+| 3 | 234 | RED | `TAIL_LATENCY_SPIKE` | This frame has a latency spike against the local baseline. | 11.25 ms | 40.00 ms | NO | 1.54x | Check system preemption, throttling, and dense-scene pressure. |
+| 4 | 211 | RED | `POSTPROCESS_DOMINANT` | Postprocess dominates this frame's runtime. | 8.77 ms | 40.00 ms | NO | 1.28x | Optimize postprocess/NMS before changing the model backbone. |
+| 5 | 163 | RED | `POSTPROCESS_DOMINANT` | Postprocess dominates this frame's runtime. | 7.34 ms | 40.00 ms | NO | 1.08x | Optimize postprocess/NMS before changing the model backbone. |
+| 6 | 172 | RED | `POSTPROCESS_DOMINANT` | Postprocess dominates this frame's runtime. | 7.27 ms | 40.00 ms | NO | 1.07x | Optimize postprocess/NMS before changing the model backbone. |
+| 7 | 149 | RED | `POSTPROCESS_DOMINANT` | Postprocess dominates this frame's runtime. | 7.40 ms | 40.00 ms | NO | 1.09x | Optimize postprocess/NMS before changing the model backbone. |
+| 8 | 97 | RED | `POSTPROCESS_DOMINANT` | Postprocess dominates this frame's runtime. | 7.16 ms | 40.00 ms | NO | 1.06x | Optimize postprocess/NMS before changing the model backbone. |
+
+### Field Diagnostic Suggestions
+
+1. **Check postprocess/NMS first.**  
+   Dense scenes can push output filtering, box handling, tracking, or NMS into a nonlinear cost path.
+
+2. **Do not immediately blame the model backbone.**  
+   If postprocess dominates, changing from one model size to another may not fix the root cause.
+
+3. **Run a parameter sweep.**  
+   Fix the video and model, then test:
+
+   ```text
+   conf = 0.25 / 0.35 / 0.45
+   max_det = 100 / 300 / 500
+   imgsz = 640 / 960
+   ```
+
+4. **Check real-time budget separately from severity.**  
+   A frame can be `RED` because it is structurally risky even when it does not exceed the current FPS budget.
+
+5. **Add system probes if tail spikes remain unexplained.**  
+   If total latency spikes while stage ratios remain normal, check background processes, thermal throttling, power limits, CPU/GPU/NPU contention, and memory pressure.
+
+---
+
+## Why Average FPS Is Not Enough
+
+Average FPS hides the frames that break real deployments.
+
+In robotics, drones, surveillance, and edge automation, the failure mode is often not:
 
 ```text
 YOLO is always slow.
 ```
 
-It is:
+It is usually:
 
 ```text
-YOLO is usually fast, but occasionally one stage spikes.
+The pipeline is mostly fast,
+but dense scenes, stream jitter, queue backlog, ROS scheduling,
+or postprocess pressure occasionally causes a dangerous stutter.
 ```
 
-This profiler separates the runtime into:
+YERP focuses on those exact frames.
+
+---
+
+## v0.2 New: Robotics & ROS Evidence
+
+YERP v0.2 is designed to go beyond pure CV inference timing.
+
+It reserves and reports fields for robotics and ROS-side latency diagnosis, including:
+
+| Cause Enum | What it means |
+|---|---|
+| `ROS_EXECUTOR_DELAY` | The frame waited too long before the callback ran. |
+| `ROS_CALLBACK_BLOCKING` | Heavy synchronous work blocked the callback path. |
+| `ROS_TF_WAIT` | TF / transform lookup blocked frame processing. |
+| `ROS_MESSAGE_ARRIVAL_DELAY` | DDS, camera driver, transport, or network jitter delayed message arrival. |
+| `ROS_QOS_DROP_OR_BACKLOG` | QoS depth, stale frames, or queue backlog may be affecting the pipeline. |
+| `CASCADE_QUEUE_DELAY` | Previous slow frames accumulated into a queue/backlog problem. |
+| `IO_STREAM_BLOCKING` | RTSP, decoder, storage, or stream IO blocked the pipeline. |
+
+This is where YERP starts to separate itself from a simple speed script.
+
+A normal timing script asks:
 
 ```text
-preprocess  -> image decode / resize / copy path
-inference   -> model forward path
-postprocess -> boxes / filtering / NMS / end-to-end output handling
+How fast was the model?
 ```
 
-Then it reports whether the runtime is:
+YERP asks:
 
 ```text
-GREEN  -> stable
-YELLOW -> tail latency or stage pressure rising
-RED    -> severe tail latency or stage pressure
+Where did the frame lose time across the CV + robotics pipeline?
 ```
 
-For low-postprocess or end-to-end models, YERP de-emphasizes postprocess-specific alarms and continues auditing total / preprocess / inference tail latency.
+---
 
-## Install
+## Installation
 
 For local development:
 
@@ -104,205 +175,192 @@ pip install -e .
 Optional dependencies for examples:
 
 ```bash
-pip install ultralytics opencv-python
+pip install ultralytics opencv-python rich
 ```
 
-The core package only requires Python and NumPy. Image capture uses OpenCV or PIL when available.
+---
 
-## 5-Line Integration
+## Quick Start: Generate a Stutter Report
+
+Run a diagnostic audit on a local video:
+
+```bash
+python examples/audit_stutter_video.py \
+  --model yolov8s.pt \
+  --source data/dense_crowd.mp4 \
+  --input-fps 25 \
+  --json stutter_report.json \
+  --markdown stutter_report.md \
+  --max-frames 300
+```
+
+Run against an RTSP stream:
+
+```bash
+python examples/audit_stutter_video.py \
+  --model yolov8s.pt \
+  --source rtsp://your-camera-stream \
+  --source-type stream \
+  --input-fps 30 \
+  --json stutter_rtsp.json \
+  --markdown stutter_rtsp.md
+```
+
+For stream/camera sources, `--input-fps` is treated as a nominal reference only.  
+YERP still measures observed arrival intervals so RTSP/network/input jitter is not hidden.
+
+---
+
+## Thresholds Are Configurable
+
+Real-time budgets vary by robot, camera FPS, model, hardware, and deployment target.
+
+YERP exposes threshold knobs so developers can tune diagnostics for their own field constraints:
+
+```bash
+python examples/audit_stutter_video.py \
+  --model yolov8s.pt \
+  --source your_video.mp4 \
+  --input-fps 25 \
+  --min-tail-latency-ms 30 \
+  --yellow-slowdown-ratio 2.0 \
+  --red-slowdown-ratio 4.0 \
+  --min-postprocess-ms 3.0 \
+  --min-target-count-postprocess 5 \
+  --yellow-postprocess-ratio 0.30 \
+  --red-postprocess-ratio 0.50
+```
+
+Recommended workflow:
+
+1. Run YERP with defaults.
+2. Check the top stutter events.
+3. Adjust thresholds based on your FPS budget and safety margin.
+4. Re-run the same video/model.
+5. Compare `RED` / `YELLOW` counts and root causes.
+
+---
+
+## Python Integration
+
+For existing Ultralytics YOLO loops:
 
 ```python
+import time
 from ultralytics import YOLO
-from yolo_edge_runtime_profiler import YoloEdgeRuntimeProfiler
+from yolo_edge_runtime_profiler.adapters.yolo_adapter import context_from_yolo_result
+from yolo_edge_runtime_profiler.engine.stutter_engine import StutterEngine
 
-model = YOLO("yolov8n.pt")
-profiler = YoloEdgeRuntimeProfiler(window_size=100)
+model = YOLO("yolov8s.pt")
+engine = StutterEngine()
 
-for result in model("video.mp4", stream=True):
-    status = profiler.update(result)
-    print(status.to_compact_string())
+for frame_id, result in enumerate(model("video.mp4", stream=True), start=1):
+    ctx = context_from_yolo_result(
+        result,
+        frame_id=frame_id,
+        timestamp_sec=time.time(),
+        source_type="file_replay",
+        source_name="video.mp4",
+    )
+
+    event = engine.process(ctx)
+
+    if event:
+        print(event.state, event.cause, event.frame_id)
 ```
 
-## Local-First Hard Example Capture
+---
 
-YERP can optionally save high-value frames when runtime pressure or confidence uncertainty appears.
+## Adapter Architecture
 
-Instead of labeling random frames, collect the frames that actually made the edge runtime unstable（Zero I/O bottleneck: Built-in cooldowns and max-item limits ensure the profiler never crashes your edge device.）:
+YERP uses a simple data contract so it does not have to stay YOLO-only.
 
 ```text
-tail-latency spikes
-postprocess spikes
-stage imbalance
-dense detection bursts
-high confidence entropy
-low mean confidence
+Adapter -> FrameInferenceContext -> StutterEngine -> StutterEvent -> Report
 ```
 
-Example:
+The generic input object is `FrameInferenceContext`.
 
-```python
-from ultralytics import YOLO
-from yolo_edge_runtime_profiler import YoloEdgeRuntimeProfiler, LocalHardExampleRecorder
+Examples:
 
-model = YOLO("yolov8n.pt")
-profiler = YoloEdgeRuntimeProfiler(window_size=100)
-recorder = LocalHardExampleRecorder(
-    output_dir="hard_examples",
-    selection_mode="pressure_or_confidence",
-    trigger_states=("RED",),
-    cooldown_sec=2.0,
-    max_items=200,
-    # Optional confidence dimension. Tune for your use case.
-    min_confidence_entropy=None,
-    max_confidence_mean=None,
-)
+| CV pipeline | Generic YERP field |
+|---|---|
+| YOLO boxes | `target_count` |
+| ORB keypoints | `target_count` |
+| Industrial regions / defects | `target_count` |
+| Classifier entropy | `scene_complexity` |
+| RTSP wait | `read_wait_ms` |
+| ROS executor delay | `ros_executor_delay_ms` |
+| TF wait | `ros_tf_wait_ms` |
+| Queue backlog | `estimated_backlog_count` |
 
-for result in model("video.mp4", stream=True):
-    status = profiler.update(result)
-    frame = getattr(result, "orig_img", None)
-    recorder.maybe_save(frame=frame, status=status)
-```
+Today, YERP includes an Ultralytics YOLO adapter.  
+Future adapters can target HALCON, ORB/SLAM, image classification, DeepStream, ROS nodes, or NPU-specific runtimes.
 
-Output:
+---
+
+## Methodology: Runtime Residual Auditing
+
+YERP uses runtime residual auditing.
+
+Instead of relying only on global averages, it compares each frame against a robust local baseline:
+
+- rolling median
+- MAD-based robust deviation
+- stage ratio analysis
+- scene pressure
+- queue / IO hints
+- reserved ROS/system fields
+
+A stutter event is treated as a residual:
 
 ```text
-hard_examples/
-├── frame_000127_1783000000123_RED_POSTPROCESS_SPIKE.jpg
-└── frame_000127_1783000000123_RED_POSTPROCESS_SPIKE.json
+actual frame behavior - local expected behavior = runtime residual
 ```
 
-The JSON sidecar stores the full runtime context:
+This design is inspired by NARH-style residual auditing: a stutter frame is a runtime residual event where timing, queue behavior, and scene pressure no longer agree with the local baseline.
 
-```json
-{
-  "schema": "yolo-edge-runtime-profiler.hard-example.v0.1",
-  "selection": {
-    "reason": "runtime_pressure",
-    "pressure_signal": {"state": "RED", "dominant_cause": "POSTPROCESS_SPIKE"},
-    "confidence_signal": {"confidence_entropy": 2.74, "confidence_mean": 0.41}
-  },
-  "status": {
-    "state": "RED",
-    "dominant_cause": "POSTPROCESS_SPIKE",
-    "stage_ms": {"preprocess": 2.1, "inference": 12.4, "postprocess": 76.8, "total": 91.3},
-    "latency_ms": {"p50": 18.6, "p95": 47.2, "p99": 91.3},
-    "residuals": {"tail_latency_coeff_p95_p50": 2.54, "postprocess_spike_coeff": 5.2}
-  },
-  "privacy_note": "Local-first capture. No upload was performed by YERP."
-}
-```
+---
 
-This is the local-first foundation for pressure-triggered hard-example mining. Nothing is uploaded unless you build or enable your own integration.
+## What YERP Is Not
 
-## CLI Usage
+YERP is not:
 
-```bash
-yolo-edge-profile --model yolov8n.pt --source video.mp4 --dashboard \
-  --json runtime_report.json \
-  --csv runtime_frames.csv
-```
+- a model trainer
+- a cloud data platform
+- a replacement for TensorRT / DeepStream / vendor profilers
+- a neural-network layer hook
+- a promise that every stutter can be identified without platform probes
 
-Enable local hard-example capture:
+YERP is:
 
-```bash
-yolo-edge-profile --model yolov8n.pt --source video.mp4 --dashboard \
-  --capture-dir hard_examples \
-  --capture-states RED \
-  --capture-cooldown-sec 2.0
-```
+- a local-first edge CV stutter diagnostics tool
+- a frame-level evidence generator
+- a bridge between CV engineers, robotics engineers, and field integrators
+- a practical way to stop guessing which part of the pipeline caused the stutter
 
-Confidence-aware sampling can be added without changing the model:
+---
 
-```bash
-yolo-edge-profile --model yolov8n.pt --source video.mp4 \
-  --capture-dir hard_examples \
-  --capture-selection-mode pressure_or_confidence \
-  --capture-min-confidence-entropy 1.8
-```
+## Diagnosis Code Cheat Sheet
 
-Camera example:
+| Cause Enum | Human meaning |
+|---|---|
+| `POSTPROCESS_PRESSURE` | Dense output increases postprocess pressure. |
+| `POSTPROCESS_DOMINANT` | Postprocess dominates the current frame runtime. |
+| `POSTPROCESS_SPIKE` | Postprocess time spikes against the local baseline. |
+| `POSTPROCESS_SPIKE_RISING` | Postprocess time is rising against the local baseline. |
+| `TAIL_LATENCY_SPIKE` | Total frame latency spikes against the local baseline. |
+| `TAIL_LATENCY_RISING` | Frame latency is rising and may become a spike. |
+| `CASCADE_QUEUE_DELAY` | Previous slow frames or backlog suggest queue delay. |
+| `IO_STREAM_BLOCKING` | Input stream, decoder, or storage IO may be blocking. |
+| `SYSTEM_WIDE_SLOWDOWN` | Whole pipeline slows down, suggesting system contention or throttling. |
+| `ROS_EXECUTOR_DELAY` | ROS executor scheduling delay before callback execution. |
+| `ROS_CALLBACK_BLOCKING` | Heavy callback work blocks the frame path. |
+| `ROS_TF_WAIT` | TF lookup waits block frame processing. |
+| `ROS_MESSAGE_ARRIVAL_DELAY` | DDS, transport, driver, or network delay affects message arrival. |
+| `ROS_QOS_DROP_OR_BACKLOG` | QoS depth, dropped frames, stale frames, or backlog are suspected. |
 
-```bash
-yolo-edge-profile --model yolov8n.pt --source 0 --dashboard --capture-dir hard_examples
-```
-
-Synthetic demo without Ultralytics:
-
-```bash
-python examples/synthetic_spike_demo.py
-```
-
-## Runtime Metrics
-
-### 1. Tail Latency Coefficient
-
-```text
-R_tail = rolling_p95_total_ms / rolling_p50_total_ms
-```
-
-This exposes cases where average FPS looks good but p95 / p99 latency is much worse.
-
-### 2. Stage Imbalance
-
-```text
-postprocess_ratio = postprocess_ms / total_ms
-```
-
-This identifies whether preprocess, inference, or postprocess is dominating the frame.
-
-### 3. Postprocess Spike Residual
-
-```text
-R_post = current_postprocess_ms / rolling_median_postprocess_ms
-```
-
-This flags sudden postprocess pressure, especially in dense scenes or output-heavy frames.
-
-### 4. Output Pressure
-
-```text
-box_count
-box_pressure_coeff
-confidence_entropy
-class_entropy
-```
-
-This records whether the detection output stream is becoming dense or uncertain.
-
-### 5. Runtime State
-
-```text
-GREEN / YELLOW / RED
-```
-
-Each state includes a `dominant_cause` and a human-readable reason.
-
-## Design Notes
-
-YERP is deliberately not a cloud platform. The current scope is:
-
-```text
-profile runtime stages
-classify tail-latency and stage pressure
-save local hard examples when pressure or uncertainty appears
-export JSON / CSV reports
-```
-
-Future integrations can connect the local hard-example folder to a private dataset store, labeling workflow, or training platform.
-
-## Roadmap: Runtime Integrity Residuals
-
-YERP v0.1 focuses on practical runtime residuals: tail latency, stage imbalance, postprocess spikes, and output pressure.
-
-Future versions may extend this into deeper runtime integrity residuals:
-
-- temporal detection associators
-- embedding drift
-- multi-scale feature inconsistency
-- pre-NMS / post-NMS candidate flow
-- small-perturbation output residuals
-
-This direction is inspired by NARH-style residual auditing, but the current release intentionally stays lightweight and zero-intrusive.
+---
 
 ## License
 
