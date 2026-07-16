@@ -53,7 +53,7 @@ YERP did not classify this frame by appearance.
 It classified this frame by runtime behavior.
 
 Full runtime evidence:
-[frame_000097_1783648890188_RED_POSTPROCESS_DOMINANT.json](assets/frame_000097_1783648890188_RED_POSTPROCESS_DOMINANT.json)
+[frame_000097_1783648890188_RED_POSTPROCESS_DOMINANT.json](assets/frame_000097_1783648890188_RED_POSTPROCESS_DOMINANT.json) (Click to see the exact bounding box entropy and latency residuals)
 
 Below is a YERP-style field diagnostic report generated from a 300-frame YOLOv8s dense crowd run.
 
