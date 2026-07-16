@@ -1,0 +1,137 @@
+{
+  "capture": {
+    "image_error": "",
+    "image_path": "hard_examples\\frame_000097_1783648890188_RED_POSTPROCESS_DOMINANT.jpg",
+    "image_saved": true,
+    "metadata_only": false
+  },
+  "capture_policy": {
+    "cooldown_sec": 0.3,
+    "enabled": true,
+    "image_ext": "jpg",
+    "max_confidence_mean": null,
+    "max_items": 200,
+    "min_box_count": 5,
+    "min_box_count_for_pressure": 5,
+    "min_confidence_entropy": null,
+    "output_dir": "hard_examples",
+    "require_enough_samples": true,
+    "save_image": true,
+    "save_metadata": true,
+    "selection_mode": "pressure_or_confidence",
+    "trigger_causes": [
+      "TAIL_LATENCY_SPIKE",
+      "TAIL_LATENCY_RISING",
+      "POSTPROCESS_SPIKE",
+      "POSTPROCESS_SPIKE_RISING",
+      "POSTPROCESS_DOMINANT",
+      "POSTPROCESS_PRESSURE"
+    ],
+    "trigger_states": [
+      "RED",
+      "YELLOW"
+    ]
+  },
+  "created_timestamp_sec": 1783648890.193353,
+  "extra_metadata": {},
+  "privacy_note": "Local-first capture. No upload was performed by YERP.",
+  "schema": "yolo-edge-runtime-profiler.hard-example.v0.1",
+  "selection": {
+    "confidence_signal": {
+      "active": false,
+      "box_count": 18,
+      "box_count_match": true,
+      "confidence_entropy": 2.5102415025019114,
+      "confidence_mean": 0.5784619417455461,
+      "entropy_active": false,
+      "max_confidence_mean": null,
+      "mean_active": false,
+      "min_box_count": 5,
+      "min_confidence_entropy": null
+    },
+    "pressure_signal": {
+      "active": true,
+      "box_count": 18,
+      "box_count_match": true,
+      "cause_match": true,
+      "dominant_cause": "POSTPROCESS_DOMINANT",
+      "min_box_count_for_pressure": 5,
+      "state": "RED",
+      "state_match": true,
+      "trigger_causes": [
+        "TAIL_LATENCY_SPIKE",
+        "TAIL_LATENCY_RISING",
+        "POSTPROCESS_SPIKE",
+        "POSTPROCESS_SPIKE_RISING",
+        "POSTPROCESS_DOMINANT",
+        "POSTPROCESS_PRESSURE"
+      ],
+      "trigger_states": [
+        "RED",
+        "YELLOW"
+      ]
+    },
+    "reason": "runtime_pressure",
+    "selected": true,
+    "selection_mode": "pressure_or_confidence"
+  },
+  "source_info": {
+    "frame": 96,
+    "model": "yolov8s.pt"
+  },
+  "status": {
+    "dominant_cause": "POSTPROCESS_DOMINANT",
+    "enough_samples": true,
+    "frame_index": 97,
+    "latency_ms": {
+      "current": 7.163524627685547,
+      "current_tail_coeff_p50": 1.0644229917633514,
+      "max": 9.351015090942383,
+      "p50": 6.7299604415893555,
+      "p95": 8.42219591140747,
+      "p99": 9.172797203063963,
+      "tail_coeff_p95_p50": 1.2514480559737844,
+      "tail_coeff_p99_p50": 1.362979364095297
+    },
+    "low_postprocess_path": false,
+    "output_pressure": {
+      "box_count": 18,
+      "box_pressure_coeff": 0.9,
+      "class_count": 4,
+      "class_entropy": 1.404678473063571,
+      "confidence_entropy": 2.5102415025019114,
+      "confidence_max": 0.854884684085846,
+      "confidence_mean": 0.5784619417455461,
+      "confidence_min": 0.2829267680644989
+    },
+    "raw_speed": {
+      "inference": 3.949403762817383,
+      "postprocess": 2.0165443420410156,
+      "preprocess": 1.1975765228271484,
+      "total": 7.163524627685547
+    },
+    "reason": "Postprocess is 28% of current total latency with 18 boxes.",
+    "residuals": {
+      "box_pressure_coeff": 0.9,
+      "current_tail_coeff_p50": 1.0644229917633514,
+      "postprocess_ratio": 0.2815016973973241,
+      "postprocess_spike_coeff": 1.8372977082654502,
+      "tail_latency_coeff_p95_p50": 1.2514480559737844,
+      "tail_latency_coeff_p99_p50": 1.362979364095297
+    },
+    "stage_ms": {
+      "inference": 3.949403762817383,
+      "postprocess": 2.0165443420410156,
+      "preprocess": 1.1975765228271484,
+      "total": 7.163524627685547
+    },
+    "stage_ratio": {
+      "inference": 0.5513213073287626,
+      "postprocess": 0.2815016973973241,
+      "preprocess": 0.16717699527391333
+    },
+    "state": "RED",
+    "timestamp_sec": 1783648890.1816323,
+    "window_size": 66
+  }
+}
