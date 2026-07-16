@@ -2,7 +2,8 @@
 
 **Find the exact frames that make your Edge CV / ROS pipeline stutter — and know why.**
 
-YERP is a lightweight, local-first stutter diagnostics tool for edge computer vision and robotics deployments.
+YERP is a lightweight, local-first stutter diagnostics tool for edge computer vision and robotics deployments. YERP doesn't benchmark models. It investigates runtime incidents.
+
 
 It does **not** just report FPS. It helps answer the field-debugging questions that actually matter:
 
@@ -29,13 +30,30 @@ Markdown / JSON report
 
 ---
 
-## Dense Scene Demo: YERP Finds the Stutter Frames
+## Scene Demo: YERP Finds the Stutter Frames
 
-![Dense Crowd Stutter Demo](assets/dense_crowd_stutter_demo.jpg)
+![Stutter Demo](assets/dense_crowd_stutter_demo.jpg)
 
-The image above is from a pedestrian scene. This is the kind of input where average FPS can look fine, while individual frames still trigger postprocess pressure, micro-stutters, or control-loop risk(YOLOv8s).
+The image above is from a pedestrian scene. This is the kind of input where average FPS can look fine, while individual frames still trigger postprocess pressure, micro-stutters, or control-loop risk.
 
-**Why is this frame RED?** To the naked eye, it's just a standard detection. But YERP's JSON trace reveals: this frame generated 18 bounding boxes with high class entropy, pushing the Postprocess/NMS runtime to 28% of total latency . The system flagged it as `POSTPROCESS_DOMINANT`, isolating the exact moment pipeline pressure spiked.
+**Why was this frame marked as Stutter Frames?**
+
+To the naked eye, this looks like a normal detection result.
+
+YERP's runtime trace tells a different story:
+
+- 18 detected objects
+- 4 semantic classes
+- Confidence entropy: 2.51
+- Postprocess: 2.02 ms (28% of total runtime)
+- Dominant Cause: `POSTPROCESS_DOMINANT`
+
+YERP did not classify this frame by appearance.
+
+It classified this frame by runtime behavior.
+
+Full runtime evidence:
+[frame_000097_1783648890188_RED_POSTPROCESS_DOMINANT.json](assets/frame_000097_1783648890188_RED_POSTPROCESS_DOMINANT.json)
 
 Below is a YERP-style field diagnostic report generated from a 300-frame YOLOv8s dense crowd run.
 
@@ -134,7 +152,21 @@ YERP focuses on those exact frames.
 
 ## v0.2 New: Robotics & ROS Evidence
 
-YERP v0.2 is designed to go beyond pure CV inference timing.
+Fast inference does not guarantee a fast robot.
+
+A detector can run at 100 FPS,
+yet the robot can still miss a control deadline because the frame
+was blocked by:
+
+- ROS Executor scheduling
+- TF lookup
+- Callback blocking
+- DDS / transport delay
+- QoS backlog
+
+YERP separates **computer vision latency** from **control-loop latency**.
+
+This distinction is often impossible to see with FPS benchmarks.
 
 It reserves and reports fields for robotics and ROS-side latency diagnosis, including:
 
@@ -189,12 +221,14 @@ Run a diagnostic audit on a local video:
 ```bash
 python examples/audit_stutter_video.py \
   --model yolov8s.pt \
-  --source data/dense_crowd.mp4 \
+  --source your_video.mp4 \
   --input-fps 25 \
   --json stutter_report.json \
   --markdown stutter_report.md \
   --max-frames 300
 ```
+Replace `your_video.mp4` with any local video,
+or use an RTSP URL for live stream diagnosis.
 
 Run against an RTSP stream:
 
